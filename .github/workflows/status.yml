@@ -1,12 +1,13 @@
 name: DEBUG ProjectsV2
 on: workflow_dispatch
+
 jobs:
   list:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/github-script@v7
         with:
-          token: ${{ secrets.ORG_PAT }}
+          github-token: ${{ secrets.ORG_PAT }}   # ← важно!
           script: |
             const org = 'fra1m-dev';
             const q = `query($org:String!){
