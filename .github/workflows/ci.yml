@@ -60,7 +60,6 @@ jobs:
           script: |
             const fs = require('fs');
             const crypto = require('crypto');
-            const { github, context, core } = global;
 
             const owner = context.repo.owner;
             const repo  = context.repo.repo;
@@ -79,7 +78,6 @@ jobs:
               const rows=[];
               for (const raw of block.split('\n')) {
                 const line = raw.trim();
-                // пропускаем заголовки таблиц и разделители
                 if (/^\|\s*-+\s*\|/.test(line) || /^\|\s*file/i.test(line)) continue;
                 const m = line.match(/^\|\s*\[([^\]]+)\]\(([^)]+)\)\s*\|\s*(\d+)\s*\|\s*(.+?)\s*\|$/);
                 if (m) rows.push({ file:m[1], link:m[2], line:m[3], text:m[4].trim().replace(/\s+/g,' ') });
@@ -113,7 +111,7 @@ jobs:
               milestoneNumber = mls[0]?.number;
             } catch (e) { core.warning(`Milestone lookup failed: ${e.message}`); }
 
-            // --- assignee = автор пуша, если коллаборатор
+            // --- фиксированное назначение
             const assignee = "IvanBoyko128";
             let canAssign = true;
             try { await github.rest.repos.checkCollaborator({ owner, repo, username: assignee }); }
@@ -123,7 +121,7 @@ jobs:
             const makeKey = (kind, it) =>
               crypto.createHash('sha1').update(`${kind}|${it.file}|${it.line}`).digest('hex');
 
-            // --- поиск открытых issues с нашим якорем (страницы по 100)
+            // --- поиск открытых issues с нашим якорем
             async function listOpenByAnchor() {
               const all = [];
               for (let page=1; page<=5; page++){
@@ -132,7 +130,6 @@ jobs:
                 all.push(...res.data.items);
                 if (res.data.items.length < 100) break;
               }
-              // key из тела
               const rx = /<!--\s*todo-key:([a-f0-9]{40})\s*-->/i;
               const byKey = new Map();
               for (const it of all) {
@@ -162,7 +159,6 @@ jobs:
                   `<!-- todo-key:${key} -->`
                 ].join('\n');
 
-                // Ищем точечно
                 const q = `repo:${owner}/${repo} is:issue is:open in:body "${key}"`;
                 const res = await github.rest.search.issuesAndPullRequests({ q, per_page: 10 });
                 const existing = res.data.items.find(i => i.state === 'open');
@@ -184,22 +180,17 @@ jobs:
               }
             }
 
-            // апдейт / апсерты
             const newKeys = new Set();
             await upsert(todos, ['todo'], 'todo', 'type: task', newKeys);
             await upsert(fixmes, ['fix','bug'], 'fixme', 'type: bug', newKeys);
 
-            // --- закрываем исчезнувшие
             const openByKey = await listOpenByAnchor();
             for (const [key, issue] of openByKey.entries()) {
               if (!newKeys.has(key)) {
                 try {
                   await github.rest.issues.addLabels({ owner, repo, issue_number: issue.number, labels: ['expired'] });
                 } catch {}
-                await github.rest.issues.update({
-                  owner, repo, issue_number: issue.number,
-                  state: 'closed'
-                });
+                await github.rest.issues.update({ owner, repo, issue_number: issue.number, state: 'closed' });
                 core.info(`Closed missing issue #${issue.number}`);
               }
             }
