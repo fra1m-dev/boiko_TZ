@@ -1,4 +1,5 @@
-//TODO:начать делать тестовое задание
+//TODO: Начать делать тестовое задание
+//TODO: Спомощью .gitignore зауигнорируй .env, чтобы он не улетал в репозитори/
 import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
 import './index.css'
