@@ -50,6 +50,7 @@ jobs:
           else
             # первый пуш ветки — запустим синк
             echo "changed=true" >> $GITHUB_OUTPUT
+          fi
 
       - name: Create/Update issues from todos.md
         if: steps.diff.outputs.changed == 'true' || github.event_name == 'workflow_dispatch'
