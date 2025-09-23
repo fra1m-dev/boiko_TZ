@@ -1,0 +1,198 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*.*.*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE_REPO: ${{ secrets.DOCKERHUB_USERNAME }}/${{ github.event.repository.name }}
+
+jobs:
+  sync_todos:
+    name: Create issues from todos.md
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    # игнорим прогон на теги; на PR просто не создаём issues
+    if: ${{ github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Check if todos.md changed (safe)
+        id: diff
+        run: |
+          set -e
+          if [ ! -f todos.md ]; then
+            echo "changed=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          if git rev-parse HEAD^ >/dev/null 2>&1; then
+            if git diff --name-only HEAD^ HEAD | grep -q "^todos.md$"; then
+              echo "changed=true" >> $GITHUB_OUTPUT
+            else
+              echo "changed=false" >> $GITHUB_OUTPUT
+            fi
+          else
+            # первый пуш ветки — запустим синк
+            echo "changed=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create/Update issues from todos.md
+        if: steps.diff.outputs.changed == 'true' || github.event_name == 'workflow_dispatch'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const crypto = require('crypto');
+
+            const owner = context.repo.owner;
+            const repo  = context.repo.repo;
+
+            if (!fs.existsSync('todos.md')) { core.info('todos.md not found. Skip'); return; }
+            const md = fs.readFileSync('todos.md','utf8').trim();
+            if (!md) { core.info('todos.md is empty. Skip'); return; }
+
+            // --- секции: всё до "### FIXMEs" — TODOs; после — FIXMEs
+            const idx = md.indexOf('### FIXMEs');
+            const todosBlock = idx === -1 ? md : md.slice(0, idx);
+            const fixmesBlock = idx === -1 ? '' : md.slice(idx);
+
+            // --- парсер строк таблицы: | [path](link) | 123 | text |
+            function parse(block){
+              const rows=[];
+              for (const raw of block.split('\n')) {
+                const line = raw.trim();
+                if (/^\|\s*-+\s*\|/.test(line) || /^\|\s*file/i.test(line)) continue;
+                const m = line.match(/^\|\s*\[([^\]]+)\]\(([^)]+)\)\s*\|\s*(\d+)\s*\|\s*(.+?)\s*\|$/);
+                if (m) rows.push({ file:m[1], link:m[2], line:m[3], text:m[4].trim().replace(/\s+/g,' ') });
+              }
+              return rows;
+            }
+            const todos = parse(todosBlock);
+            const fixmes = parse(fixmesBlock);
+
+            if (!todos.length && !fixmes.length) { core.info('No rows parsed. Skip'); return; }
+
+            // --- ensure labels
+            async function ensureLabel(name,color,desc){
+              try { await github.rest.issues.getLabel({ owner, repo, name }); }
+              catch {
+                try { await github.rest.issues.createLabel({ owner, repo, name, color, description: desc }); }
+                catch (err) { core.warning(`Label "${name}" not created: ${err.status} ${err.message}`); }
+              }
+            }
+            await ensureLabel('todo', '0E8A16', 'Auto-created from TODOs');
+            await ensureLabel('fix',  'D73A4A', 'Auto-created from FIXMEs');
+            await ensureLabel('bug',  'B60205', 'Bug');
+            await ensureLabel('type: task', '0052CC', 'Type: task');
+            await ensureLabel('type: bug',  'D73A4A', 'Type: bug');
+            await ensureLabel('expired',    'BFBFBF', 'Auto-closed: no longer present in todos.md');
+
+            // --- открытый milestone (первый)
+            let milestoneNumber = undefined;
+            try {
+              const { data: mls } = await github.rest.issues.listMilestones({ owner, repo, state: 'open', per_page: 1 });
+              milestoneNumber = mls[0]?.number;
+            } catch (e) { core.warning(`Milestone lookup failed: ${e.message}`); }
+
+            // --- фиксированное назначение
+            const assignee = "IvanBoyko128";
+            let canAssign = true;
+            try { await github.rest.repos.checkCollaborator({ owner, repo, username: assignee }); }
+            catch { canAssign = false; }
+
+            // --- стабильный ключ
+            const makeKey = (kind, it) =>
+              crypto.createHash('sha1').update(`${kind}|${it.file}|${it.line}`).digest('hex');
+
+            // --- поиск открытых issues с нашим якорем
+            async function listOpenByAnchor() {
+              const all = [];
+              for (let page=1; page<=5; page++){
+                const q = `repo:${owner}/${repo} is:issue is:open in:body "todo-key:"`;
+                const res = await github.rest.search.issuesAndPullRequests({ q, per_page: 100, page });
+                all.push(...res.data.items);
+                if (res.data.items.length < 100) break;
+              }
+              const rx = /<!--\s*todo-key:([a-f0-9]{40})\s*-->/i;
+              const byKey = new Map();
+              for (const it of all) {
+                const m = it.body && it.body.match(rx);
+                if (m) byKey.set(m[1], it);
+              }
+              return byKey;
+            }
+
+            // --- ссылки на конкретный коммит
+            const repoBase = `https://github.com/${owner}/${repo}/blob/${context.sha}/`;
+            const abs = (link)=> link.startsWith('http') ? link : `${repoBase}${link}`;
+
+            async function upsert(items, coreLabels, kind, typeLabel, keysSet){
+              for (const it of items) {
+                const key = makeKey(kind, it);
+                keysSet.add(key);
+                const title = `[${kind}] ${it.text}`.slice(0,250);
+                const body = [
+                  `**Type:** ${kind}`,
+                  ``,
+                  `- File: \`${it.file}\` (line ${it.line})`,
+                  `- Link: ${abs(it.link)}`,
+                  ``,
+                  `> Extracted automatically from \`todos.md\`.`,
+                  ``,
+                  `<!-- todo-key:${key} -->`
+                ].join('\n');
+
+                const q = `repo:${owner}/${repo} is:issue is:open in:body "${key}"`;
+                const res = await github.rest.search.issuesAndPullRequests({ q, per_page: 10 });
+                const existing = res.data.items.find(i => i.state === 'open');
+
+                const labels = [...new Set([...coreLabels, typeLabel])];
+
+                if (existing) {
+                  await github.rest.issues.update({
+                    owner, repo, issue_number: existing.number,
+                    title, body, labels, milestone: milestoneNumber
+                  });
+                } else {
+                  await github.rest.issues.create({
+                    owner, repo, title, body,
+                    labels, milestone: milestoneNumber,
+                    assignees: canAssign ? [assignee] : undefined
+                  });
+                }
+              }
+            }
+
+            const newKeys = new Set();
+            await upsert(todos, ['todo'], 'todo', 'type: task', newKeys);
+            await upsert(fixmes, ['fix','bug'], 'fixme', 'type: bug', newKeys);
+
+            const openByKey = await listOpenByAnchor();
+            for (const [key, issue] of openByKey.entries()) {
+              if (!newKeys.has(key)) {
+                try {
+                  await github.rest.issues.addLabels({ owner, repo, issue_number: issue.number, labels: ['expired'] });
+                } catch {}
+                await github.rest.issues.update({ owner, repo, issue_number: issue.number, state: 'closed' });
+                core.info(`Closed missing issue #${issue.number}`);
+              }
+            }
+
+            core.info(`Synced ${todos.length} todos, ${fixmes.length} fixmes; active keys: ${newKeys.size}`);
