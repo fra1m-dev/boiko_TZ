@@ -1,4 +1,8 @@
+// FIXME: Вместо обычных тегов используй antd библиотеку
+
 import { useState } from 'react'
+
+// FIXME: Ассеты тебе по сути тоже не нужны, можешь удалить
 import reactLogo from './assets/react.svg'
 import viteLogo from '/vite.svg'
 import './App.css'
